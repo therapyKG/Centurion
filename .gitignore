@@ -1,0 +1,24 @@
+# Xcode
+build/
+DerivedData/
+*.xcuserdata
+*.xcworkspace/xcuserdata/
+xcuserdata/
+
+# Swift Package Manager
+.swiftpm/
+.build/
+Packages/
+
+# Python
+.mlvenv/
+__pycache__/
+*.pyc
+
+# CoreML models (large binaries)
+*.mlmodel
+*.mlmodelc
+*.mlpackage
+
+# macOS
+.DS_Store
