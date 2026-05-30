@@ -1,0 +1,509 @@
+import CenturionMLX
+import CommonCrypto
+import Foundation
+import Network
+import OSLog
+
+// MARK: - Orchestrator Message Types
+
+private enum OrchMsg {
+    // Orchestrator → Server
+    nonisolated static let updateConfig: UInt8 = 0x90
+    nonisolated static let startTraining: UInt8 = 0x91
+    nonisolated static let stopTraining: UInt8 = 0x92
+    nonisolated static let getStatus: UInt8 = 0x93
+    nonisolated static let identify: UInt8 = 0x94
+    nonisolated static let allowWorker: UInt8 = 0x95
+
+    // Server → Orchestrator
+    nonisolated static let statusReport: UInt8 = 0xA0
+    nonisolated static let configAck: UInt8 = 0xA1
+    nonisolated static let trainingStarted: UInt8 = 0xA2
+    nonisolated static let trainingStopped: UInt8 = 0xA3
+    nonisolated static let lossUpdate: UInt8 = 0xA4
+    nonisolated static let error: UInt8 = 0xA5
+    nonisolated static let allowWorkerAck: UInt8 = 0xA6
+
+    // Auth (shared)
+    nonisolated static let authChallenge: UInt8 = 0x30
+    nonisolated static let authResponse: UInt8 = 0x31
+    nonisolated static let authResult: UInt8 = 0x32
+}
+
+// MARK: - Server State
+
+enum ServerState: String {
+    case idle = "Idle"
+    case configuring = "Configuring"
+    case training = "Training"
+
+    init(byte: UInt8) {
+        switch byte {
+        case 1: self = .configuring
+        case 2: self = .training
+        default: self = .idle
+        }
+    }
+}
+
+// MARK: - Worker Info (from status reports)
+
+struct WorkerStatus: Identifiable {
+    var id: UInt32 { workerId }
+    let workerId: UInt32
+    let deviceType: UInt32
+    let memoryMB: UInt32
+    let stageIndex: UInt32
+
+    var deviceName: String {
+        switch deviceType {
+        case 1: return "iPhone"
+        case 2: return "iPad"
+        case 3: return "Mac"
+        default: return "Unknown"
+        }
+    }
+}
+
+// MARK: - Orchestrator Manager
+
+@MainActor
+@Observable
+final class OrchestratorManager {
+
+    // MARK: - Observable State
+
+    var status: String = "Configure and connect to orchestrator port."
+    var isConnected: Bool = false
+    var authFailed: Bool = false
+    var workerBypassReady: Bool = false
+
+    var serverState: ServerState = .idle
+    var connectedWorkers: [WorkerStatus] = []
+    var currentStep: Int = 0
+    var totalSteps: Int = 0
+    var latestLoss: Float = 0
+    var lossHistory: [Float] = []
+
+    // Editable config
+    var dModel: Int = 512
+    var nHeads: Int = 8
+    var nLayers: Int = 8
+    var seqLen: Int = 128
+    var batchSize: Int = 2
+    var microBatches: Int = 4
+    var configTotalSteps: Int = 200
+    var learningRate: Float = 3e-4
+    var vocabSize: Int = 50257
+    var ffnHiddenMul: Int = 4
+    var dropout: Float = 0.1
+
+    var trainingLog: [GPTTrainingLogEntry] = []
+
+    // Server connection
+    var serverHost: String = "34.60.122.134"
+    var serverPort: UInt16 = 9998
+    var serverSecret: String = ""
+
+    // Internal
+    private var connection: NWConnection?
+    private var messageTask: Task<Void, Never>?
+    private var pollTask: Task<Void, Never>?
+    private let logger = Logger(subsystem: "Centurion", category: "Orchestrator")
+
+    // MARK: - Connection
+
+    func connect() {
+        disconnect()
+
+        guard !serverSecret.isEmpty else {
+            status = "Enter orchestrator secret first."
+            log("Error: secret is empty")
+            return
+        }
+
+        let endpoint = NWEndpoint.hostPort(
+            host: NWEndpoint.Host(serverHost),
+            port: NWEndpoint.Port(rawValue: serverPort)!
+        )
+        let params = NWParameters.tcp
+        params.serviceClass = .responsiveData
+
+        let conn = NWConnection(to: endpoint, using: params)
+        self.connection = conn
+
+        let secret = serverSecret
+        authFailed = false
+        status = "Connecting to \(serverHost):\(serverPort)..."
+        log("Connecting to \(serverHost):\(serverPort)...")
+
+        conn.stateUpdateHandler = { [weak self] state in
+            Task { @MainActor [weak self] in
+                switch state {
+                case .ready:
+                    self?.status = "Authenticating..."
+                    self?.log("TCP connected, authenticating...")
+                    let authOk = await self?.performAuth(connection: conn, secret: secret) ?? false
+                    if authOk {
+                        // Send ORCH_IDENTIFY so server knows this is an orchestrator (not a worker)
+                        do {
+                            var identifyMsg = Data()
+                            identifyMsg.append(OrchMsg.identify)
+                            try await Self.sendFrame(connection: conn, payload: identifyMsg)
+                        } catch {
+                            self?.log("Failed to send identify: \(error)")
+                            conn.cancel()
+                            return
+                        }
+                        self?.isConnected = true
+                        self?.status = "Connected to orchestrator port."
+                        self?.log("Authenticated & identified. Listening for server messages...")
+                        self?.startMessageLoop(connection: conn)
+                        self?.startPolling(connection: conn)
+                    } else {
+                        self?.isConnected = false
+                        self?.authFailed = true
+                        self?.status = "Authentication failed — wrong secret"
+                        self?.log("Auth failed")
+                        conn.cancel()
+                    }
+                case .failed(let e):
+                    self?.isConnected = false
+                    self?.status = "Connection failed: \(e.localizedDescription)"
+                    self?.log("Connection failed: \(e.localizedDescription)")
+                case .cancelled:
+                    self?.isConnected = false
+                default: break
+                }
+            }
+        }
+
+        conn.start(queue: DispatchQueue(label: "com.centurion.orchestrator", qos: .userInitiated))
+    }
+
+    func disconnect() {
+        messageTask?.cancel()
+        messageTask = nil
+        pollTask?.cancel()
+        pollTask = nil
+        connection?.cancel()
+        connection = nil
+        isConnected = false
+    }
+
+    // MARK: - Authentication
+
+    private func performAuth(connection: NWConnection, secret: String) async -> Bool {
+        do {
+            let challenge = try await Self.receiveFrame(connection: connection)
+            guard challenge.count == 33, challenge[0] == OrchMsg.authChallenge else {
+                log("Bad auth challenge: len=\(challenge.count)")
+                return false
+            }
+            let nonce = challenge.subdata(in: 1..<33)
+            let mac = Self.hmacSHA256(key: Data(secret.utf8), data: nonce)
+
+            var response = Data()
+            response.append(OrchMsg.authResponse)
+            response.append(mac)
+            try await Self.sendFrame(connection: connection, payload: response)
+
+            let result = try await Self.receiveFrame(connection: connection)
+            guard result.count == 2, result[0] == OrchMsg.authResult else {
+                log("Bad auth result: len=\(result.count)")
+                return false
+            }
+            return result[1] == 0
+        } catch {
+            log("Auth error: \(error)")
+            return false
+        }
+    }
+
+    nonisolated static func hmacSHA256(key: Data, data: Data) -> Data {
+        var mac = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        key.withUnsafeBytes { keyPtr in
+            data.withUnsafeBytes { dataPtr in
+                CCHmac(
+                    CCHmacAlgorithm(kCCHmacAlgSHA256),
+                    keyPtr.baseAddress, key.count,
+                    dataPtr.baseAddress, data.count,
+                    &mac
+                )
+            }
+        }
+        return Data(mac)
+    }
+
+    // MARK: - Commands
+
+    func updateConfig() {
+        guard let connection, isConnected else { return }
+        Task {
+            do {
+                var msg = Data()
+                msg.append(OrchMsg.updateConfig)
+                appendBE(&msg, UInt32(vocabSize))
+                appendBE(&msg, UInt32(dModel))
+                appendBE(&msg, UInt32(nHeads))
+                appendBE(&msg, UInt32(nLayers))
+                appendBE(&msg, UInt32(seqLen))
+                appendBE(&msg, UInt32(batchSize))
+                appendBE(&msg, UInt32(ffnHiddenMul))
+                appendBE(&msg, UInt32(microBatches))
+                appendBE(&msg, UInt32(configTotalSteps))
+                appendBEFloat(&msg, learningRate)
+                appendBEFloat(&msg, dropout)
+                try await Self.sendFrame(connection: connection, payload: msg)
+                log("Config update sent")
+            } catch {
+                log("Failed to send config: \(error)")
+            }
+        }
+    }
+
+    func startTraining() {
+        guard let connection, isConnected else { return }
+        Task {
+            do {
+                var msg = Data()
+                msg.append(OrchMsg.startTraining)
+                try await Self.sendFrame(connection: connection, payload: msg)
+                log("Start training requested")
+            } catch {
+                log("Failed to send start: \(error)")
+            }
+        }
+    }
+
+    func stopTraining() {
+        guard let connection, isConnected else { return }
+        Task {
+            do {
+                var msg = Data()
+                msg.append(OrchMsg.stopTraining)
+                try await Self.sendFrame(connection: connection, payload: msg)
+                log("Stop training requested")
+            } catch {
+                log("Failed to send stop: \(error)")
+            }
+        }
+    }
+
+    func requestStatus() {
+        guard let connection, isConnected else { return }
+        Task {
+            do {
+                var msg = Data()
+                msg.append(OrchMsg.getStatus)
+                try await Self.sendFrame(connection: connection, payload: msg)
+            } catch {
+                log("Failed to request status: \(error)")
+            }
+        }
+    }
+
+    /// Ask the server to allow our IP to connect as a worker without HMAC auth.
+    func requestWorkerBypass() {
+        guard let connection, isConnected else { return }
+        workerBypassReady = false
+        Task {
+            do {
+                var msg = Data()
+                msg.append(OrchMsg.allowWorker)
+                try await Self.sendFrame(connection: connection, payload: msg)
+                log("Requested worker auth bypass")
+            } catch {
+                log("Failed to request worker bypass: \(error)")
+            }
+        }
+    }
+
+    // MARK: - Message Loop
+
+    private func startMessageLoop(connection: NWConnection) {
+        messageTask = Task.detached(priority: .userInitiated) { [weak self] in
+            do {
+                while !Task.isCancelled {
+                    let frame = try await Self.receiveFrame(connection: connection)
+                    await self?.handleMessage(frame)
+                }
+            } catch {
+                await MainActor.run { [weak self] in
+                    self?.log("Message loop ended: \(error)")
+                    self?.isConnected = false
+                    self?.status = "Disconnected: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    private func startPolling(connection: NWConnection) {
+        pollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(3))
+                self?.requestStatus()
+            }
+        }
+    }
+
+    private func handleMessage(_ data: Data) {
+        guard !data.isEmpty else { return }
+        let msgType = data[0]
+
+        switch msgType {
+        case OrchMsg.statusReport:
+            parseStatusReport(data)
+
+        case OrchMsg.configAck:
+            let ok = data.count >= 2 && data[1] == 0
+            log("Config ACK: \(ok ? "OK" : "FAIL")")
+            status = ok ? "Config updated on server." : "Config update failed."
+
+        case OrchMsg.trainingStarted:
+            log("Training started by server")
+            serverState = .training
+            lossHistory.removeAll()
+            status = "Training in progress..."
+
+        case OrchMsg.trainingStopped:
+            if data.count >= 9 {
+                let steps = Int(readBE32(data, offset: 1))
+                let loss = readBEFloat(data, offset: 5)
+                log("Training stopped: \(steps) steps, final loss \(String(format: "%.4f", loss))")
+            }
+            serverState = .idle
+            status = "Training complete. Server idle."
+
+        case OrchMsg.lossUpdate:
+            if data.count >= 9 {
+                let step = Int(readBE32(data, offset: 1))
+                let loss = readBEFloat(data, offset: 5)
+                currentStep = step
+                latestLoss = loss
+                lossHistory.append(loss)
+            }
+
+        case OrchMsg.allowWorkerAck:
+            let ok = data.count >= 2 && data[1] == 0
+            workerBypassReady = ok
+            if ok {
+                log("Server ready — worker bypass active")
+            } else {
+                log("Server denied worker bypass")
+            }
+
+        case OrchMsg.error:
+            if data.count >= 5 {
+                let msgLen = Int(readBE32(data, offset: 1))
+                if data.count >= 5 + msgLen {
+                    let errMsg = String(data: data.subdata(in: 5..<(5 + msgLen)), encoding: .utf8) ?? "Unknown"
+                    log("Server error: \(errMsg)")
+                    status = "Error: \(errMsg)"
+                }
+            }
+
+        default:
+            log("Unknown message: 0x\(String(format: "%02x", msgType))")
+        }
+    }
+
+    private func parseStatusReport(_ data: Data) {
+        guard data.count >= 18 else { return }
+        var offset = 1
+
+        let stateByte = data[offset]; offset += 1
+        serverState = ServerState(byte: stateByte)
+
+        let numWorkers = Int(readBE32(data, offset: offset)); offset += 4
+        currentStep = Int(readBE32(data, offset: offset)); offset += 4
+        totalSteps = Int(readBE32(data, offset: offset)); offset += 4
+        latestLoss = readBEFloat(data, offset: offset); offset += 4
+
+        var workers: [WorkerStatus] = []
+        for _ in 0..<numWorkers {
+            guard data.count >= offset + 16 else { break }
+            let wId = readBE32(data, offset: offset); offset += 4
+            let dType = readBE32(data, offset: offset); offset += 4
+            let mem = readBE32(data, offset: offset); offset += 4
+            let stage = readBE32(data, offset: offset); offset += 4
+            workers.append(WorkerStatus(workerId: wId, deviceType: dType, memoryMB: mem, stageIndex: stage))
+        }
+        connectedWorkers = workers
+
+        if serverState != .training {
+            status = "Server \(serverState.rawValue). \(numWorkers) worker(s) connected."
+        }
+    }
+
+    // MARK: - Logging
+
+    func log(_ message: String) {
+        let entry = GPTTrainingLogEntry(timestamp: Date(), message: message)
+        trainingLog.append(entry)
+        logger.info("\(message, privacy: .public)")
+    }
+
+    func clearLog() {
+        trainingLog.removeAll()
+    }
+
+    // MARK: - Big-Endian Helpers
+
+    private func appendBE(_ data: inout Data, _ value: UInt32) {
+        withUnsafeBytes(of: value.bigEndian) { data.append(contentsOf: $0) }
+    }
+
+    private func appendBEFloat(_ data: inout Data, _ value: Float) {
+        withUnsafeBytes(of: value.bitPattern.bigEndian) { data.append(contentsOf: $0) }
+    }
+
+    private func readBE32(_ data: Data, offset: Int) -> UInt32 {
+        data.withUnsafeBytes { ptr in
+            UInt32(bigEndian: ptr.loadUnaligned(fromByteOffset: offset, as: UInt32.self))
+        }
+    }
+
+    private func readBEFloat(_ data: Data, offset: Int) -> Float {
+        let bits = data.withUnsafeBytes { ptr in
+            UInt32(bigEndian: ptr.loadUnaligned(fromByteOffset: offset, as: UInt32.self))
+        }
+        return Float(bitPattern: bits)
+    }
+
+    // MARK: - Network I/O
+
+    nonisolated static func sendFrame(connection: NWConnection, payload: Data) async throws {
+        let frame = withUnsafeBytes(of: UInt32(payload.count).bigEndian) { Data($0) } + payload
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            connection.send(content: frame, completion: .contentProcessed { error in
+                if let error { cont.resume(throwing: error) }
+                else { cont.resume() }
+            })
+        }
+    }
+
+    nonisolated static func receiveFrame(connection: NWConnection) async throws -> Data {
+        let lengthData = try await receiveExactly(connection: connection, count: 4)
+        let payloadLength = lengthData.withUnsafeBytes { ptr in
+            UInt32(bigEndian: ptr.loadUnaligned(as: UInt32.self))
+        }
+        return try await receiveExactly(connection: connection, count: Int(payloadLength))
+    }
+
+    private nonisolated static func receiveExactly(connection: NWConnection, count: Int) async throws -> Data {
+        var buffer = Data()
+        while buffer.count < count {
+            let remaining = count - buffer.count
+            let chunk: Data = try await withCheckedThrowingContinuation { cont in
+                connection.receive(minimumIncompleteLength: 1, maximumLength: remaining) { data, _, _, error in
+                    if let error { cont.resume(throwing: error) }
+                    else if let data, !data.isEmpty { cont.resume(returning: data) }
+                    else { cont.resume(throwing: NWError.posix(.ECONNRESET)) }
+                }
+            }
+            buffer.append(chunk)
+        }
+        return buffer
+    }
+}
