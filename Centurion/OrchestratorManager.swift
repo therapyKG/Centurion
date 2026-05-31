@@ -105,6 +105,13 @@ final class OrchestratorManager {
     var serverPort: UInt16 = 9998
     var serverSecret: String = ""
 
+    /// Called when the orchestrator disconnects (spontaneous or explicit).
+    /// ConnectionView observes this to clean up worker-bypass state.
+    var onDisconnect: (() -> Void)?
+
+    /// Continuation for awaiting the worker bypass acknowledgment.
+    private var bypassContinuation: CheckedContinuation<Bool, Never>?
+
     // Internal
     private var connection: NWConnection?
     private var messageTask: Task<Void, Never>?
@@ -168,9 +175,9 @@ final class OrchestratorManager {
                         conn.cancel()
                     }
                 case .failed(let e):
-                    self?.isConnected = false
                     self?.status = "Connection failed: \(e.localizedDescription)"
                     self?.log("Connection failed: \(e.localizedDescription)")
+                    self?.disconnect()
                 case .cancelled:
                     self?.isConnected = false
                 default: break
@@ -188,7 +195,26 @@ final class OrchestratorManager {
         pollTask = nil
         connection?.cancel()
         connection = nil
+
+        let wasConnected = isConnected
         isConnected = false
+        workerBypassReady = false
+
+        // Clear server-side state so UI doesn't show stale data
+        serverState = .idle
+        connectedWorkers = []
+        currentStep = 0
+        totalSteps = 0
+        latestLoss = 0
+        lossHistory = []
+
+        // Cancel any pending bypass wait
+        bypassContinuation?.resume(returning: false)
+        bypassContinuation = nil
+
+        if wasConnected {
+            onDisconnect?()
+        }
     }
 
     // MARK: - Authentication
@@ -304,19 +330,48 @@ final class OrchestratorManager {
     }
 
     /// Ask the server to allow our IP to connect as a worker without HMAC auth.
-    func requestWorkerBypass() {
-        guard let connection, isConnected else { return }
+    /// Returns `true` if the server acknowledged the bypass, `false` on failure/timeout.
+    func requestWorkerBypass() async -> Bool {
+        guard let connection, isConnected else { return false }
         workerBypassReady = false
-        Task {
-            do {
-                var msg = Data()
-                msg.append(OrchMsg.allowWorker)
-                try await Self.sendFrame(connection: connection, payload: msg)
-                log("Requested worker auth bypass")
-            } catch {
-                log("Failed to request worker bypass: \(error)")
-            }
+
+        // Cancel any previous pending bypass wait
+        bypassContinuation?.resume(returning: false)
+        bypassContinuation = nil
+
+        do {
+            var msg = Data()
+            msg.append(OrchMsg.allowWorker)
+            try await Self.sendFrame(connection: connection, payload: msg)
+            log("Requested worker auth bypass")
+        } catch {
+            log("Failed to request worker bypass: \(error)")
+            return false
         }
+
+        // Wait for the message loop to deliver the ACK, with a 10s timeout
+        let result = await withTaskGroup(of: Bool.self) { group in
+            group.addTask { @MainActor in
+                await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+                    self.bypassContinuation = cont
+                }
+            }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(10))
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+
+        if !result {
+            // Timeout or failure — clean up
+            bypassContinuation?.resume(returning: false)
+            bypassContinuation = nil
+        }
+
+        return result
     }
 
     // MARK: - Message Loop
@@ -330,9 +385,11 @@ final class OrchestratorManager {
                 }
             } catch {
                 await MainActor.run { [weak self] in
-                    self?.log("Message loop ended: \(error)")
-                    self?.isConnected = false
-                    self?.status = "Disconnected: \(error.localizedDescription)"
+                    guard let self else { return }
+                    self.log("Message loop ended: \(error)")
+                    self.status = "Disconnected: \(error.localizedDescription)"
+                    // Full cleanup including notifying listeners
+                    self.disconnect()
                 }
             }
         }
@@ -392,6 +449,9 @@ final class OrchestratorManager {
             } else {
                 log("Server denied worker bypass")
             }
+            // Resume anyone awaiting the bypass result
+            bypassContinuation?.resume(returning: ok)
+            bypassContinuation = nil
 
         case OrchMsg.error:
             if data.count >= 5 {

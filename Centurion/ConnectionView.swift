@@ -10,6 +10,7 @@ struct ConnectionView: View {
     @State private var identity: String = ""
     @State private var secret: String = ""
     @State private var connectingWorkerViaBridge: Bool = false
+    @State private var workerBridgeError: String?
     @FocusState private var focusedField: Field?
 
     private enum Field { case host, port, identity, secret }
@@ -44,6 +45,13 @@ struct ConnectionView: View {
             }
         }
         .scrollDismissesKeyboard(.interactively)
+        .onAppear {
+            // When orchestrator drops spontaneously, clean up worker-bridge state
+            orchestratorManager.onDisconnect = { [self] in
+                connectingWorkerViaBridge = false
+                workerBridgeError = nil
+            }
+        }
     }
 
     // MARK: - Login (not connected)
@@ -100,20 +108,17 @@ struct ConnectionView: View {
 
     @ViewBuilder
     private var connectedView: some View {
-        // Status
         Section("Connection") {
-            HStack {
-                Image(systemName: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
-                if orchestratorManager.isConnected {
+            if orchestratorManager.isConnected {
+                HStack {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
                     Text("Orchestrator")
-                } else {
-                    Text("Worker")
+                    Spacer()
+                    Text("\(host):\(portText)")
+                        .foregroundStyle(.secondary)
+                        .font(.caption)
                 }
-                Spacer()
-                Text("\(host):\(portText)")
-                    .foregroundStyle(.secondary)
-                    .font(.caption)
             }
 
             if pipelineManager.isConnected {
@@ -121,6 +126,12 @@ struct ConnectionView: View {
                     Image(systemName: "checkmark.circle.fill")
                         .foregroundStyle(.green)
                     Text("Worker")
+                    if !orchestratorManager.isConnected {
+                        Spacer()
+                        Text("\(host):\(portText)")
+                            .foregroundStyle(.secondary)
+                            .font(.caption)
+                    }
                 }
             }
         }
@@ -152,8 +163,8 @@ struct ConnectionView: View {
                         }
                     }
 
-                    if pipelineManager.authFailed {
-                        Label("Worker connection failed", systemImage: "xmark.shield.fill")
+                    if let error = workerBridgeError {
+                        Label(error, systemImage: "xmark.shield.fill")
                             .foregroundStyle(.red)
                             .font(.caption)
                     }
@@ -164,10 +175,7 @@ struct ConnectionView: View {
         // Disconnect
         Section {
             Button("Disconnect") {
-                orchestratorManager.disconnect()
-                pipelineManager.disconnect()
-                connectingWorkerViaBridge = false
-                secret = ""
+                disconnectAll()
             }
             .foregroundStyle(.red)
         }
@@ -196,24 +204,23 @@ struct ConnectionView: View {
     private func connectWorkerViaBridge() {
         guard let port = UInt16(portText) else { return }
         connectingWorkerViaBridge = true
+        workerBridgeError = nil
         pipelineManager.authFailed = false
 
-        // Ask the server to whitelist our IP for one-time worker auth bypass
-        orchestratorManager.requestWorkerBypass()
-
-        // Watch for the bypass acknowledgment, then connect as worker
         Task { @MainActor in
-            // Poll for bypass readiness (up to 5 seconds)
-            for _ in 0..<50 {
-                if orchestratorManager.workerBypassReady {
-                    break
-                }
-                try? await Task.sleep(for: .milliseconds(100))
+            // Ask the server to whitelist our IP — awaits the ACK or times out
+            let bypassGranted = await orchestratorManager.requestWorkerBypass()
+
+            guard bypassGranted else {
+                connectingWorkerViaBridge = false
+                workerBridgeError = "Server denied worker bypass"
+                return
             }
 
-            guard orchestratorManager.workerBypassReady else {
+            guard orchestratorManager.isConnected else {
+                // Orchestrator dropped while we were waiting
                 connectingWorkerViaBridge = false
-                pipelineManager.authFailed = true
+                workerBridgeError = "Orchestrator disconnected"
                 return
             }
 
@@ -224,8 +231,15 @@ struct ConnectionView: View {
             pipelineManager.serverSecret = "bypass"
             pipelineManager.connect()
             connectingWorkerViaBridge = false
-            orchestratorManager.workerBypassReady = false
         }
+    }
+
+    private func disconnectAll() {
+        orchestratorManager.disconnect()
+        pipelineManager.disconnect()
+        connectingWorkerViaBridge = false
+        workerBridgeError = nil
+        secret = ""
     }
 }
 

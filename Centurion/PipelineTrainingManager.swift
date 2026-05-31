@@ -152,9 +152,9 @@ final class PipelineTrainingManager {
                         conn.cancel()
                     }
                 case .failed(let e):
-                    self?.isConnected = false
                     self?.status = "Connection failed: \(e.localizedDescription)"
                     self?.log("Connection failed: \(e.localizedDescription)")
+                    self?.disconnect()
                 case .cancelled:
                     self?.isConnected = false
                 default: break
@@ -173,6 +173,14 @@ final class PipelineTrainingManager {
         isConnected = false
         isTraining = false
         pipelineConfigured = false
+        progress = 0
+        currentStep = 0
+        currentLoss = 0
+        avgForwardMs = 0
+        avgBackwardMs = 0
+        avgSendMs = 0
+        avgRecvMs = 0
+        pipelineEfficiency = 0
     }
 
     // MARK: - Authentication
@@ -293,7 +301,8 @@ final class PipelineTrainingManager {
 
         } catch {
             log("Pipeline setup error: \(error)")
-            status = "Pipeline setup failed: \(error.localizedDescription)"
+            status = "Disconnected: \(error.localizedDescription)"
+            disconnect()
         }
     }
 

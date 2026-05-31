@@ -83,7 +83,9 @@ WORKER_SECRET = b""
 ORCH_SECRET = b""
 
 # IPs that are allowed to skip worker auth (one-time use, set by orchestrator)
-worker_auth_bypass: set = set()
+# Maps IP -> expiry timestamp (monotonic)
+worker_auth_bypass: Dict[str, float] = {}
+BYPASS_EXPIRY_SECONDS = 30.0
 
 
 # ── Frame I/O ──
@@ -150,11 +152,14 @@ async def authenticate_client(reader, writer, addr) -> Optional[str]:
 
     # Check worker auth bypass (orchestrator vouched for this IP)
     if client_ip and client_ip in worker_auth_bypass:
-        worker_auth_bypass.discard(client_ip)
-        result = struct.pack(">BB", MSG_AUTH_RESULT, 0)
-        await write_frame(writer, result)
-        log.info(f"Auth OK from {addr} (worker bypass, vouched by orchestrator)")
-        return "worker"
+        expiry = worker_auth_bypass.pop(client_ip)
+        if time.monotonic() < expiry:
+            result = struct.pack(">BB", MSG_AUTH_RESULT, 0)
+            await write_frame(writer, result)
+            log.info(f"Auth OK from {addr} (worker bypass, vouched by orchestrator)")
+            return "worker"
+        else:
+            log.warning(f"Worker bypass for {client_ip} expired")
 
     log.warning(f"Auth FAILED from {addr}")
     result = struct.pack(">BB", MSG_AUTH_RESULT, 1)
@@ -193,6 +198,13 @@ class TextDataset:
 
 
 # ── Pipeline State Machine ──
+
+class WorkerDisconnectedError(Exception):
+    """Raised when a worker disconnects during an active training loop."""
+    def __init__(self, worker_id: int):
+        self.worker_id = worker_id
+        super().__init__(f"Worker {worker_id} disconnected during training")
+
 
 class PipelineState(Enum):
     IDLE = "idle"
@@ -257,8 +269,59 @@ class PipelineOrchestrator:
 
     def remove_worker(self, worker_id: int):
         if worker_id in self.workers:
-            del self.workers[worker_id]
+            w = self.workers.pop(worker_id)
+            try:
+                w.writer.close()
+            except Exception:
+                pass
             log.info(f"Worker {worker_id} removed. Total: {len(self.workers)}")
+
+    def reset_assignments(self):
+        """Clear all stage assignments and training metrics.
+
+        Called between training runs and when the orchestrator disconnects
+        so that status reports show workers as 'Unassigned' and metrics
+        don't carry over from a previous run.
+
+        Note: does NOT touch total_steps — that is a config value set
+        before this method is called in start_training().
+        """
+        for w in self.workers.values():
+            w.stage_index = -1
+            w.first_layer = 0
+            w.last_layer = 0
+            w.is_head = False
+            w.is_tail = False
+        self.current_step = 0
+        self.loss_history.clear()
+        log.info(f"Reset assignments and metrics for {len(self.workers)} worker(s)")
+
+    async def probe_workers(self):
+        """Probe all registered workers to detect dead connections.
+
+        Sends a PIPELINE_STOP to each worker (which is harmless — workers
+        in their idle loop simply ignore it or treat it as a no-op between
+        runs) and checks if the write succeeds.  drain() alone cannot detect
+        a remotely-closed socket; an actual write is required.
+        """
+        probe_payload = struct.pack(">B", MSG_PIPELINE_STOP)
+        dead: List[int] = []
+        for w in list(self.workers.values()):
+            try:
+                await asyncio.wait_for(
+                    write_frame(w.writer, probe_payload), timeout=5.0
+                )
+            except (ConnectionResetError, BrokenPipeError, OSError,
+                    asyncio.TimeoutError, Exception) as e:
+                log.info(f"Probe: worker {w.worker_id} is dead ({e}), removing")
+                dead.append(w.worker_id)
+        for wid in dead:
+            self.remove_worker(wid)
+        if dead:
+            log.info(f"Probe complete: removed {len(dead)} dead worker(s), "
+                     f"{len(self.workers)} remaining")
+        else:
+            log.info(f"Probe complete: all {len(self.workers)} worker(s) alive")
 
     def assign_stages(self):
         """Assign pipeline stages: split layers evenly across workers."""
@@ -287,10 +350,11 @@ class PipelineOrchestrator:
             )
 
     async def send_pipeline_config(self):
-        """Send PIPELINE_CONFIG to each worker."""
+        """Send PIPELINE_CONFIG to each worker. Returns list of dead worker IDs."""
         cfg = self.config
         num_micro_batches = cfg.get("num_micro_batches", 4)
-        for worker in self.workers.values():
+        dead: List[int] = []
+        for worker in list(self.workers.values()):
             payload = struct.pack(
                 ">B"         # type
                 "IIII"       # stage_index, total_stages, first_layer, last_layer
@@ -310,37 +374,73 @@ class PipelineOrchestrator:
                 cfg["batch_size"], cfg["ffn_hidden_mul"],
                 cfg["learning_rate"], cfg["dropout"],
             )
-            await write_frame(worker.writer, payload)
-            log.info(f"Sent PIPELINE_CONFIG to worker {worker.worker_id}")
+            try:
+                await write_frame(worker.writer, payload)
+                log.info(f"Sent PIPELINE_CONFIG to worker {worker.worker_id}")
+            except (ConnectionResetError, BrokenPipeError, OSError) as e:
+                log.error(f"Failed to send CONFIG to worker {worker.worker_id}: {e}")
+                dead.append(worker.worker_id)
+        for wid in dead:
+            self.remove_worker(wid)
+        return dead
 
     async def wait_for_config_acks(self, timeout=30.0):
-        """Wait for CONFIG_ACK from all workers."""
-        pending = set(self.workers.keys())
+        """Wait for CONFIG_ACK from all workers.
+
+        Workers that disconnect during the wait are removed.
+        Returns True if all remaining workers ACK'd successfully.
+        """
+        acked: set = set()
+        dead: List[int] = []
 
         async def wait_ack(worker: WorkerInfo):
-            resp = await asyncio.wait_for(
-                read_frame(worker.reader), timeout=timeout
-            )
-            if resp[0] == MSG_PIPELINE_CONFIG_ACK:
-                status = resp[5] if len(resp) > 5 else resp[1]
-                if status == 0:
-                    log.info(f"CONFIG_ACK OK from worker {worker.worker_id}")
-                    pending.discard(worker.worker_id)
-                else:
-                    log.error(f"CONFIG_ACK FAIL from worker {worker.worker_id}")
+            try:
+                resp = await asyncio.wait_for(
+                    read_frame(worker.reader), timeout=timeout
+                )
+                if resp[0] == MSG_PIPELINE_CONFIG_ACK:
+                    status = resp[5] if len(resp) > 5 else resp[1]
+                    if status == 0:
+                        log.info(f"CONFIG_ACK OK from worker {worker.worker_id}")
+                        acked.add(worker.worker_id)
+                    else:
+                        log.error(f"CONFIG_ACK FAIL from worker {worker.worker_id}")
+            except (asyncio.IncompleteReadError, ConnectionResetError,
+                    BrokenPipeError, OSError, asyncio.TimeoutError) as e:
+                log.error(f"Worker {worker.worker_id} disconnected during CONFIG_ACK: {e}")
+                dead.append(worker.worker_id)
 
-        tasks = [wait_ack(w) for w in self.workers.values()]
+        tasks = [wait_ack(w) for w in list(self.workers.values())]
         await asyncio.gather(*tasks)
-        if pending:
-            log.error(f"Missing ACKs from workers: {pending}")
+
+        for wid in dead:
+            self.remove_worker(wid)
+
+        if dead:
+            log.error(f"Lost {len(dead)} worker(s) during config phase")
+            return False
+
+        expected = set(self.workers.keys())
+        if acked != expected:
+            missing = expected - acked
+            log.error(f"Missing ACKs from workers: {missing}")
             return False
         return True
 
     async def send_pipeline_start(self):
         """Broadcast PIPELINE_START to all workers."""
         payload = struct.pack(">BI", MSG_PIPELINE_START, self.total_steps)
-        for worker in self.workers.values():
-            await write_frame(worker.writer, payload)
+        dead: List[int] = []
+        for worker in list(self.workers.values()):
+            try:
+                await write_frame(worker.writer, payload)
+            except (ConnectionResetError, BrokenPipeError, OSError) as e:
+                log.error(f"Failed to send START to worker {worker.worker_id}: {e}")
+                dead.append(worker.worker_id)
+        for wid in dead:
+            self.remove_worker(wid)
+        if dead:
+            raise WorkerDisconnectedError(dead[0])
         log.info(f"PIPELINE_START sent to all workers ({self.total_steps} steps)")
 
     async def send_pipeline_stop(self):
@@ -401,20 +501,24 @@ class PipelineOrchestrator:
                 pass
 
     async def start_training(self):
-        """Full training run: assign stages → config → start → loop → idle."""
-        n_workers = len(self.workers)
-        if n_workers < self.min_workers:
-            err = f"Need at least {self.min_workers} workers, have {n_workers}"
-            log.error(err)
-            await self.notify_orch_error(err)
-            return
-
+        """Full training run: probe → reset → assign stages → config → start → loop → idle."""
         self.stop_requested = False
-        self.loss_history.clear()
-        self.current_step = 0
         self.total_steps = self.config.get("total_steps", 200)
 
         try:
+            # Probe for dead workers before we try to use them
+            await self.probe_workers()
+
+            # Clear stale assignments and metrics from previous run
+            self.reset_assignments()
+
+            n_workers = len(self.workers)
+            if n_workers < self.min_workers:
+                err = f"Need at least {self.min_workers} workers, have {n_workers}"
+                log.error(err)
+                await self.notify_orch_error(err)
+                return
+
             # Assign stages
             self.assign_stages()
 
@@ -436,12 +540,23 @@ class PipelineOrchestrator:
             # Send config to all workers
             self.state = PipelineState.CONFIGURING
             log.info("Sending PIPELINE_CONFIG to all workers...")
-            await self.send_pipeline_config()
+            dead_on_config = await self.send_pipeline_config()
+            if dead_on_config:
+                # Workers died during config — abort if not enough remain
+                if len(self.workers) < self.min_workers:
+                    err = (f"Workers died during config. "
+                           f"Need {self.min_workers}, have {len(self.workers)}")
+                    log.error(err)
+                    await self.notify_orch_error(err)
+                    self.state = PipelineState.IDLE
+                    self.training_start_event.clear()
+                    self.training_done_event.set()
+                    return
 
             # Wait for ACKs
             log.info("Waiting for CONFIG_ACK from all workers...")
             if not await self.wait_for_config_acks():
-                err = "Failed to configure all workers"
+                err = f"Failed to configure all workers (have {len(self.workers)} remaining)"
                 log.error(err)
                 await self.notify_orch_error(err)
                 self.state = PipelineState.IDLE
@@ -471,16 +586,39 @@ class PipelineOrchestrator:
                 except Exception:
                     pass
 
+        except WorkerDisconnectedError as e:
+            log.error(f"Training aborted: {e}")
+            self.remove_worker(e.worker_id)
+            await self.notify_orch_error(str(e))
         except Exception as e:
             log.error(f"Training error: {e}", exc_info=True)
             await self.notify_orch_error(str(e))
         finally:
-            # Tell workers to exit their training loops and wait for next CONFIG
+            # Tell remaining workers to exit their training loops and wait for next CONFIG
             await self.send_pipeline_stop()
             self.state = PipelineState.IDLE
             self.training_start_event.clear()
             self.training_done_event.set()
+            # Clear stale assignments so status reports show "Unassigned"
+            self.reset_assignments()
             log.info("Server state → IDLE. Workers stay connected.")
+
+    async def _worker_read(self, worker: "WorkerInfo") -> bytes:
+        """Read a frame from a worker, raising WorkerDisconnectedError on failure."""
+        try:
+            return await asyncio.wait_for(read_frame(worker.reader), timeout=60.0)
+        except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError,
+                OSError, asyncio.TimeoutError) as e:
+            log.error(f"Worker {worker.worker_id} read failed: {e}")
+            raise WorkerDisconnectedError(worker.worker_id) from e
+
+    async def _worker_write(self, worker: "WorkerInfo", payload: bytes):
+        """Write a frame to a worker, raising WorkerDisconnectedError on failure."""
+        try:
+            await write_frame(worker.writer, payload)
+        except (ConnectionResetError, BrokenPipeError, OSError) as e:
+            log.error(f"Worker {worker.worker_id} write failed: {e}")
+            raise WorkerDisconnectedError(worker.worker_id) from e
 
     async def run_training_loop(self):
         """Main training loop: stream data, relay activations/gradients."""
@@ -513,13 +651,13 @@ class PipelineOrchestrator:
                 batch_targets[m] = targets
                 batch_tokens[m] = tokens
                 data_msg = self.build_data_batch(m, mini_batch, tokens, targets)
-                await write_frame(head_worker.writer, data_msg)
+                await self._worker_write(head_worker, data_msg)
 
             # ── Phase 2: Relay activations forward ──
             if mini_batch < 3:
                 log.info(f"[mb {mini_batch}] Phase 2: Relaying {M} activations head→tail...")
             for m in range(M):
-                act_frame = await read_frame(head_worker.reader)
+                act_frame = await self._worker_read(head_worker)
                 if act_frame[0] != MSG_PIPELINE_ACTIVATION:
                     log.warning(f"Expected ACTIVATION, got 0x{act_frame[0]:02x}")
                     continue
@@ -546,38 +684,35 @@ class PipelineOrchestrator:
                 relay_msg += struct.pack(">I", len(tgt_be)) + tgt_be
                 relay_msg += struct.pack(">I", st_len) + st_data
 
-                await write_frame(tail_worker.writer, relay_msg)
+                await self._worker_write(tail_worker, relay_msg)
 
             # ── Phase 3: Relay gradients backward ──
             if mini_batch < 3:
                 log.info(f"[mb {mini_batch}] Phase 3: Relaying {M} gradients tail→head...")
             for m in range(M):
-                grad_frame = await read_frame(tail_worker.reader)
+                grad_frame = await self._worker_read(tail_worker)
                 if grad_frame[0] == MSG_PIPELINE_LOSS_REPORT:
                     _, mb_id, ub_id, loss_val, step = struct.unpack_from(">BIIfI", grad_frame, 0)
                     self.loss_history.append(loss_val)
                     # Forward loss to orchestrator
                     await self.notify_orch_loss(mini_batch, loss_val)
-                    grad_frame = await read_frame(tail_worker.reader)
+                    grad_frame = await self._worker_read(tail_worker)
 
                 if grad_frame[0] != MSG_PIPELINE_GRADIENT:
                     log.warning(f"Expected GRADIENT, got 0x{grad_frame[0]:02x}")
                     continue
 
-                await write_frame(head_worker.writer, grad_frame)
+                await self._worker_write(head_worker, grad_frame)
 
             # ── Phase 4: Sync barrier ──
             barrier = struct.pack(">BI", MSG_PIPELINE_SYNC_BARRIER, mini_batch)
             for w in sorted_workers:
-                await write_frame(w.writer, barrier)
+                await self._worker_write(w, barrier)
 
             for w in sorted_workers:
-                try:
-                    ack = await asyncio.wait_for(read_frame(w.reader), timeout=30.0)
-                    if ack[0] != MSG_PIPELINE_SYNC_ACK:
-                        log.warning(f"Expected SYNC_ACK from worker {w.worker_id}, got 0x{ack[0]:02x}")
-                except asyncio.TimeoutError:
-                    log.error(f"Sync timeout from worker {w.worker_id}")
+                ack = await self._worker_read(w)
+                if ack[0] != MSG_PIPELINE_SYNC_ACK:
+                    log.warning(f"Expected SYNC_ACK from worker {w.worker_id}, got 0x{ack[0]:02x}")
 
             elapsed_ms = (time.monotonic() - t0) * 1000
 
@@ -658,7 +793,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         else:
             log.warning(f"Role mismatch from {addr}: auth={role}, msg=0x{msg_type:02x}")
 
-    except (asyncio.IncompleteReadError, ConnectionResetError, asyncio.TimeoutError):
+    except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError,
+            OSError, asyncio.TimeoutError):
         log.info(f"Client {addr} disconnected during identification")
     except Exception as e:
         log.error(f"Error identifying client {addr}: {e}", exc_info=True)
@@ -694,10 +830,12 @@ async def handle_worker_session(reader, writer, addr, reg_frame):
         while True:
             try:
                 if orchestrator.training_start_event.is_set():
-                    # Signal that this worker has yielded its reader
-                    orchestrator._readers_yielded_count += 1
-                    if orchestrator._readers_yielded_count >= len(orchestrator.workers):
-                        orchestrator._readers_yielded_event.set()
+                    # Only participate if this worker was included in the current training run
+                    if worker_info.stage_index >= 0:
+                        # Signal that this worker has yielded its reader
+                        orchestrator._readers_yielded_count += 1
+                        if orchestrator._readers_yielded_count >= len(orchestrator.workers):
+                            orchestrator._readers_yielded_event.set()
                     # Wait for training to finish before resuming idle loop
                     await orchestrator.training_done_event.wait()
                 else:
@@ -715,17 +853,25 @@ async def handle_worker_session(reader, writer, addr, reg_frame):
                     if start_waiter in done:
                         # Training is starting — loop back to yield reader
                         continue
-                    # Sleep finished — probe connection liveness
+                    # Sleep finished — probe connection liveness.
+                    # drain() alone cannot detect a remotely-closed socket;
+                    # we must write actual data. PIPELINE_STOP is harmless —
+                    # idle workers simply ignore it ("Received STOP (between
+                    # runs), continuing to wait for CONFIG...").
                     try:
-                        await asyncio.wait_for(writer.drain(), timeout=5.0)
+                        probe = struct.pack(">B", MSG_PIPELINE_STOP)
+                        await asyncio.wait_for(
+                            write_frame(writer, probe), timeout=5.0
+                        )
                     except (ConnectionResetError, BrokenPipeError, OSError,
                             asyncio.TimeoutError):
-                        log.info(f"Worker {worker_info.worker_id} connection lost")
+                        log.info(f"Worker {worker_info.worker_id} connection lost (probe failed)")
                         break
             except asyncio.CancelledError:
                 break
 
-    except (asyncio.IncompleteReadError, ConnectionResetError, asyncio.TimeoutError):
+    except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError,
+            OSError, asyncio.TimeoutError):
         log.info(f"Worker {addr} disconnected")
     except Exception as e:
         log.error(f"Error handling worker {addr}: {e}", exc_info=True)
@@ -810,8 +956,8 @@ async def handle_orchestrator_session(reader, writer, addr):
                 # Whitelist the orchestrator's IP for one worker auth bypass.
                 orch_ip = addr[0] if addr else None
                 if orch_ip:
-                    worker_auth_bypass.add(orch_ip)
-                    log.info(f"Worker auth bypass set for IP {orch_ip}")
+                    worker_auth_bypass[orch_ip] = time.monotonic() + BYPASS_EXPIRY_SECONDS
+                    log.info(f"Worker auth bypass set for IP {orch_ip} (expires in {BYPASS_EXPIRY_SECONDS}s)")
                     ack = struct.pack(">BB", MSG_ORCH_ALLOW_WORKER_ACK, 0)
                     await write_frame(writer, ack)
                 else:
@@ -822,12 +968,20 @@ async def handle_orchestrator_session(reader, writer, addr):
             else:
                 log.warning(f"Unknown orchestrator message: 0x{msg_type:02x}")
 
-    except (asyncio.IncompleteReadError, ConnectionResetError, asyncio.TimeoutError):
+    except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError,
+            OSError, asyncio.TimeoutError):
         log.info(f"Orchestrator {addr} disconnected")
     except Exception as e:
         log.error(f"Orchestrator error: {e}", exc_info=True)
     finally:
         orchestrator.orch_writer = None
+        # If training is active, request a stop so the run winds down
+        if orchestrator.state == PipelineState.TRAINING:
+            log.info("Orchestrator disconnected during training — requesting stop")
+            orchestrator.stop_requested = True
+        else:
+            # Clear stale assignments when orchestrator disconnects outside training
+            orchestrator.reset_assignments()
         log.info("Orchestrator slot freed")
 
 
