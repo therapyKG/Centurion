@@ -1,0 +1,61 @@
+{
+  "object" : {
+    "artifacts" : [
+
+    ],
+    "dependencies" : [
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "centurionmlx",
+          "kind" : "fileSystem",
+          "location" : "/Users/kurtgu/Centurion/CenturionMLX",
+          "name" : "CenturionMLX"
+        },
+        "state" : {
+          "name" : "fileSystem",
+          "path" : "/Users/kurtgu/Centurion/CenturionMLX"
+        },
+        "subpath" : "centurionmlx"
+      },
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "mlx-swift",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/ml-explore/mlx-swift.git",
+          "name" : "mlx-swift"
+        },
+        "state" : {
+          "checkoutState" : {
+            "revision" : "61b9e011e09a62b489f6bd647958f1555bdf2896",
+            "version" : "0.31.3"
+          },
+          "name" : "sourceControlCheckout"
+        },
+        "subpath" : "mlx-swift"
+      },
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "swift-numerics",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/apple/swift-numerics",
+          "name" : "swift-numerics"
+        },
+        "state" : {
+          "checkoutState" : {
+            "revision" : "0c0290ff6b24942dadb83a929ffaaa1481df04a2",
+            "version" : "1.1.1"
+          },
+          "name" : "sourceControlCheckout"
+        },
+        "subpath" : "swift-numerics"
+      }
+    ],
+    "prebuilts" : [
+
+    ]
+  },
+  "version" : 7
+}

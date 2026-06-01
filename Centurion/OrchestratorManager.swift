@@ -14,6 +14,7 @@ private enum OrchMsg {
     nonisolated static let getStatus: UInt8 = 0x93
     nonisolated static let identify: UInt8 = 0x94
     nonisolated static let allowWorker: UInt8 = 0x95
+    nonisolated static let restartServer: UInt8 = 0x96
 
     // Server → Orchestrator
     nonisolated static let statusReport: UInt8 = 0xA0
@@ -23,6 +24,8 @@ private enum OrchMsg {
     nonisolated static let lossUpdate: UInt8 = 0xA4
     nonisolated static let error: UInt8 = 0xA5
     nonisolated static let allowWorkerAck: UInt8 = 0xA6
+    nonisolated static let restartAck: UInt8 = 0xA7
+    nonisolated static let profileReport: UInt8 = 0xA8
 
     // Auth (shared)
     nonisolated static let authChallenge: UInt8 = 0x30
@@ -65,6 +68,39 @@ struct WorkerStatus: Identifiable {
     }
 }
 
+// MARK: - Worker Profile Result (from profiling phase)
+
+struct WorkerProfileResult: Identifiable {
+    var id: UInt32 { workerId }
+    let workerId: UInt32
+    let deviceType: UInt32
+    let availableMemoryMB: UInt32
+    let computeSpeed: Float     // layers/sec
+    let assignedLayers: UInt32
+    let firstLayer: UInt32
+    let lastLayer: UInt32
+    let isHead: Bool
+    let isTail: Bool
+    let estimatedStepMs: Float
+    let maxLayers: UInt32
+    let rttMs: Float
+
+    var deviceName: String {
+        switch deviceType {
+        case 1: return "iPhone"
+        case 2: return "iPad"
+        case 3: return "Mac"
+        default: return "Unknown"
+        }
+    }
+
+    var roleName: String {
+        if isHead { return "HEAD" }
+        if isTail { return "TAIL" }
+        return "MID"
+    }
+}
+
 // MARK: - Orchestrator Manager
 
 @MainActor
@@ -85,12 +121,48 @@ final class OrchestratorManager {
     var latestLoss: Float = 0
     var lossHistory: [Float] = []
 
-    // Editable config
-    var dModel: Int = 512
-    var nHeads: Int = 8
-    var nLayers: Int = 8
+    // Profiling results
+    var profilingResults: [WorkerProfileResult] = []
+    var isProfiling: Bool = false
+
+    var pipelineStageCount: Int {
+        if !profilingResults.isEmpty {
+            return profilingResults.count
+        }
+        return connectedWorkers.filter { $0.stageIndex != UInt32.max }.count
+    }
+
+    var pipelineBubbleEfficiency: Double? {
+        let stages = pipelineStageCount
+        guard stages > 0, microBatches > 0 else { return nil }
+        return Double(microBatches) / Double(microBatches + stages - 1)
+    }
+
+    var pipelineBubbleFraction: Double? {
+        guard let pipelineBubbleEfficiency else { return nil }
+        return 1.0 - pipelineBubbleEfficiency
+    }
+
+    var pipelineStageBalance: Double? {
+        guard !profilingResults.isEmpty else { return nil }
+        let stageTimes = profilingResults.map { Double($0.estimatedStepMs) }.filter { $0 > 0 }
+        guard stageTimes.count == profilingResults.count,
+              let maxStageTime = stageTimes.max(),
+              maxStageTime > 0 else { return nil }
+        return stageTimes.reduce(0, +) / (Double(stageTimes.count) * maxStageTime)
+    }
+
+    var pipelineUtilization: Double? {
+        guard let pipelineBubbleEfficiency else { return nil }
+        return pipelineBubbleEfficiency * (pipelineStageBalance ?? 1.0)
+    }
+
+    // Editable config (GPT-2 Medium defaults)
+    var dModel: Int = 1024
+    var nHeads: Int = 16
+    var nLayers: Int = 24
     var seqLen: Int = 128
-    var batchSize: Int = 2
+    var batchSize: Int = 1
     var microBatches: Int = 4
     var configTotalSteps: Int = 200
     var learningRate: Float = 3e-4
@@ -207,6 +279,8 @@ final class OrchestratorManager {
         totalSteps = 0
         latestLoss = 0
         lossHistory = []
+        profilingResults = []
+        isProfiling = false
 
         // Cancel any pending bypass wait
         bypassContinuation?.resume(returning: false)
@@ -290,14 +364,18 @@ final class OrchestratorManager {
 
     func startTraining() {
         guard let connection, isConnected else { return }
+        isProfiling = true
+        profilingResults = []
+        status = "Profiling workers..."
         Task {
             do {
                 var msg = Data()
                 msg.append(OrchMsg.startTraining)
                 try await Self.sendFrame(connection: connection, payload: msg)
-                log("Start training requested")
+                log("Start training requested (profiling phase first)")
             } catch {
                 log("Failed to send start: \(error)")
+                isProfiling = false
             }
         }
     }
@@ -312,6 +390,20 @@ final class OrchestratorManager {
                 log("Stop training requested")
             } catch {
                 log("Failed to send stop: \(error)")
+            }
+        }
+    }
+
+    func restartServer() {
+        guard let connection, isConnected else { return }
+        Task {
+            do {
+                var msg = Data()
+                msg.append(OrchMsg.restartServer)
+                try await Self.sendFrame(connection: connection, payload: msg)
+                log("Server restart requested")
+            } catch {
+                log("Failed to send restart: \(error)")
             }
         }
     }
@@ -420,6 +512,7 @@ final class OrchestratorManager {
         case OrchMsg.trainingStarted:
             log("Training started by server")
             serverState = .training
+            isProfiling = false
             lossHistory.removeAll()
             status = "Training in progress..."
 
@@ -453,7 +546,21 @@ final class OrchestratorManager {
             bypassContinuation?.resume(returning: ok)
             bypassContinuation = nil
 
+        case OrchMsg.restartAck:
+            log("Server restart complete")
+            connectedWorkers = []
+            serverState = .idle
+            currentStep = 0
+            totalSteps = 0
+            latestLoss = 0
+            lossHistory = []
+            profilingResults = []
+            isProfiling = false
+            status = "Server restarted. Workers disconnected."
+
         case OrchMsg.error:
+            isProfiling = false
+            serverState = .idle
             if data.count >= 5 {
                 let msgLen = Int(readBE32(data, offset: 1))
                 if data.count >= 5 + msgLen {
@@ -463,8 +570,56 @@ final class OrchestratorManager {
                 }
             }
 
+        case OrchMsg.profileReport:
+            parseProfileReport(data)
+
         default:
             log("Unknown message: 0x\(String(format: "%02x", msgType))")
+        }
+    }
+
+    private func parseProfileReport(_ data: Data) {
+        guard data.count >= 5 else { return }
+        var offset = 1
+
+        let numWorkers = Int(readBE32(data, offset: offset)); offset += 4
+
+        var results: [WorkerProfileResult] = []
+        // Each worker entry: 4+4 + 4 + 4 + 4 + 4+4 + 1+1 + 4 + 4 + 4 = 42 bytes
+        for _ in 0..<numWorkers {
+            guard data.count >= offset + 42 else { break }
+
+            let wId = readBE32(data, offset: offset); offset += 4
+            let dType = readBE32(data, offset: offset); offset += 4
+            let availMB = readBE32(data, offset: offset); offset += 4
+            let speed = readBEFloat(data, offset: offset); offset += 4
+            let assigned = readBE32(data, offset: offset); offset += 4
+            let first = readBE32(data, offset: offset); offset += 4
+            let last = readBE32(data, offset: offset); offset += 4
+            let isHead = data[offset] != 0; offset += 1
+            let isTail = data[offset] != 0; offset += 1
+            let estStep = readBEFloat(data, offset: offset); offset += 4
+            let maxL = readBE32(data, offset: offset); offset += 4
+            let rtt = readBEFloat(data, offset: offset); offset += 4
+
+            results.append(WorkerProfileResult(
+                workerId: wId, deviceType: dType,
+                availableMemoryMB: availMB, computeSpeed: speed,
+                assignedLayers: assigned, firstLayer: first, lastLayer: last,
+                isHead: isHead, isTail: isTail,
+                estimatedStepMs: estStep, maxLayers: maxL, rttMs: rtt
+            ))
+        }
+
+        profilingResults = results
+        isProfiling = false
+        status = "Profiling complete. Training starting..."
+
+        for r in results {
+            log(String(format: "%@ W%d (%@): %d layers [%d..%d), %.1f L/s, %dMB avail, est %.0fms/step",
+                        r.roleName, r.workerId, r.deviceName,
+                        r.assignedLayers, r.firstLayer, r.lastLayer,
+                        r.computeSpeed, r.availableMemoryMB, r.estimatedStepMs))
         }
     }
 

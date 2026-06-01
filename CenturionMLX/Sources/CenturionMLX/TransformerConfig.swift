@@ -57,6 +57,17 @@ public struct TransformerConfig: Sendable {
             beta1: 0.9, beta2: 0.95
         )
     }
+
+    /// GPT-2 medium preset (BPE vocab: 50,257)
+    public static var gpt2Medium: TransformerConfig {
+        TransformerConfig(
+            vocabSize: 50257,
+            dModel: 1024, nHeads: 16, nLayers: 24,
+            seqLen: 128, batchSize: 1,
+            learningRate: 3e-4, weightDecay: 0.1,
+            beta1: 0.9, beta2: 0.95
+        )
+    }
 }
 
 // MARK: - Training Log Entry

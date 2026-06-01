@@ -40,6 +40,9 @@ private enum PipelineMsg {
     nonisolated static let activation: UInt8 = 0x60
     nonisolated static let gradient: UInt8 = 0x61
 
+    nonisolated static let profileRequest: UInt8 = 0x48
+    nonisolated static let profileResult: UInt8 = 0x49
+
     nonisolated static let syncBarrier: UInt8 = 0x70
     nonisolated static let syncAck: UInt8 = 0x71
 
@@ -59,6 +62,18 @@ struct PipelineStageInfo {
     var isHead: Bool = false
     var isTail: Bool = false
     var numMicroBatches: Int = 4
+}
+
+private actor PipelineFrameSendQueue {
+    let connection: NWConnection
+
+    init(connection: NWConnection) {
+        self.connection = connection
+    }
+
+    func send(_ payload: Data) async throws {
+        try await PipelineTrainingManager.sendFrame(connection: connection, payload: payload)
+    }
 }
 
 @MainActor
@@ -99,6 +114,7 @@ final class PipelineTrainingManager {
     // Internal
     private var model: GPT2Model?
     private var optimizer: AdamW?
+    private var modelConfig = TransformerConfig()
     private var connection: NWConnection?
     private var trainingTask: Task<Void, Never>?
 
@@ -250,10 +266,19 @@ final class PipelineTrainingManager {
 
             // Persistent loop: wait for CONFIG → train → repeat
             while true {
-                // Wait for PIPELINE_CONFIG (ignore STOP messages from previous run)
+                // Wait for PIPELINE_CONFIG (handle STOP and PROFILE_REQUEST first)
                 let configFrame = try await Self.receiveFrame(connection: connection)
                 if configFrame[0] == PipelineMsg.stop {
                     log("Received STOP (between runs), continuing to wait for CONFIG...")
+                    continue
+                }
+                if configFrame[0] == PipelineMsg.profileRequest {
+                    log("Received PROFILE_REQUEST, running benchmark...")
+                    status = "Profiling device performance..."
+                    let result = await runProfiling(configFrame)
+                    try await Self.sendFrame(connection: connection, payload: result)
+                    log("Profiling complete, sent results to server")
+                    status = "Profiling done. Waiting for pipeline assignment..."
                     continue
                 }
                 guard configFrame[0] == PipelineMsg.config else {
@@ -278,7 +303,8 @@ final class PipelineTrainingManager {
                 try await Self.sendFrame(connection: connection, payload: ack)
 
                 pipelineConfigured = true
-                status = "Configured as \(stageInfo.isHead ? "HEAD" : "TAIL") worker. Waiting for training start..."
+                let roleName = stageInfo.isHead ? "HEAD" : stageInfo.isTail ? "TAIL" : "MIDDLE"
+                status = "Configured as \(roleName) worker. Waiting for training start..."
 
                 // Wait for PIPELINE_START
                 let startFrame = try await Self.receiveFrame(connection: connection)
@@ -330,24 +356,212 @@ final class PipelineTrainingManager {
     }
 
     private func buildModel() {
-        log("Building GPT-2 model: d=\(config.dModel) h=\(config.nHeads) L=\(config.nLayers) seq=\(config.seqLen)")
+        var localConfig = config
+        let assignedLayers = max(1, stageInfo.lastLayer - stageInfo.firstLayer)
+        localConfig.nLayers = assignedLayers
+        modelConfig = localConfig
 
-        let m = GPT2Model(config: config)
+        log("Building GPT-2 slice: d=\(localConfig.dModel) h=\(localConfig.nHeads) localL=\(assignedLayers) totalL=\(config.nLayers) seq=\(localConfig.seqLen)")
+
+        let m = GPT2Model(config: localConfig)
         MLX.eval(m)
         self.model = m
 
         self.optimizer = AdamW(
-            learningRate: config.learningRate,
-            betas: (config.beta1, config.beta2),
+            learningRate: localConfig.learningRate,
+            betas: (localConfig.beta1, localConfig.beta2),
             eps: 1e-8,
-            weightDecay: config.weightDecay
+            weightDecay: localConfig.weightDecay
         )
 
         let paramCount = m.parameters().flattenedValues().reduce(0) { $0 + $1.size }
         let paramStr = paramCount >= 1_000_000
             ? String(format: "%.1fM", Double(paramCount) / 1_000_000.0)
             : String(format: "%.1fK", Double(paramCount) / 1000.0)
-        log("Model built: \(paramStr) params (evaluating layers [\(stageInfo.firstLayer)..\(stageInfo.lastLayer)))")
+        log("Model built: \(paramStr) params (global layers [\(stageInfo.firstLayer)..\(stageInfo.lastLayer)), local [0..\(assignedLayers)))")
+    }
+
+    // MARK: - Profiling
+
+    private func runProfiling(_ data: Data) async -> Data {
+        // Parse PROFILE_REQUEST: [1B type][7×4B config fields]
+        var offset = 1
+        let vocabSize = Int(readBigEndianUInt32(data, offset: offset)); offset += 4
+        let dModel = Int(readBigEndianUInt32(data, offset: offset)); offset += 4
+        let nHeads = Int(readBigEndianUInt32(data, offset: offset)); offset += 4
+        let nLayersTotal = Int(readBigEndianUInt32(data, offset: offset)); offset += 4
+        let seqLen = Int(readBigEndianUInt32(data, offset: offset)); offset += 4
+        let batchSize = Int(readBigEndianUInt32(data, offset: offset)); offset += 4
+        let ffnHiddenMul = Int(readBigEndianUInt32(data, offset: offset)); offset += 4
+
+        log("Profiling: d=\(dModel) h=\(nHeads) L=\(nLayersTotal) seq=\(seqLen) B=\(batchSize)")
+
+        // Use a small vocab for the probe model to avoid the 206MB embedding table
+        // (50257 × 1024 × 4B = 206MB). The embedding size doesn't affect transformer
+        // block timing, and for HEAD/TAIL we just need *some* embedding to measure overhead.
+        let probeVocab = min(vocabSize, 512)
+        let probeConfig = TransformerConfig(
+            vocabSize: probeVocab,
+            dModel: dModel,
+            nHeads: nHeads,
+            nLayers: 1,
+            ffnHiddenMul: ffnHiddenMul,
+            seqLen: seqLen,
+            batchSize: batchSize
+        )
+
+        let availableMemory = os_proc_available_memory()
+        log("Available memory: \(availableMemory / (1024 * 1024)) MB (probe vocab=\(probeVocab))")
+
+        let clock = ContinuousClock()
+
+        var layerFwdMs: Double = 0
+        var layerBwdMs: Double = 0
+        var layerPeakMem: Int = 0
+        var headFwdMs: Double = 0
+        var headBwdMs: Double = 0
+        var headPeakMem: Int = 0
+        var tailFwdMs: Double = 0
+        var tailBwdMs: Double = 0
+        var tailPeakMem: Int = 0
+
+        // ── Phase 1: Profile single transformer layer (MIDDLE path) ──
+        // Each phase in its own scope so the probe model is deallocated between phases
+        do {
+            let model = GPT2Model(config: probeConfig)
+            let act = MLXRandom.normal([batchSize, seqLen, dModel])
+            let upstream = MLXRandom.normal([batchSize, seqLen, dModel])
+            MLX.eval(model, act, upstream)
+
+            // Warmup
+            let warmup = model.forwardMiddle(act, fromLayer: 0, toLayer: 1)
+            MLX.eval(warmup)
+            Memory.clearCache()
+
+            Memory.peakMemory = 0  // reset peak counter
+            let memBefore = Memory.activeMemory
+
+            let t0 = clock.now
+            let fwd = model.forwardMiddle(act, fromLayer: 0, toLayer: 1)
+            MLX.eval(fwd)
+            layerFwdMs = Self.durationMs(from: t0, to: clock.now)
+
+            let t1 = clock.now
+            let gradFn = grad { (input: MLXArray) -> MLXArray in
+                middleSurrogateLoss(model: model, inputActivation: input,
+                                    upstreamGrads: upstream, fromLayer: 0, toLayer: 1)
+            }
+            let g = gradFn(act)
+            MLX.eval(g)
+            layerBwdMs = Self.durationMs(from: t1, to: clock.now)
+            layerPeakMem = max(0, Int(Memory.peakMemory) - Int(memBefore))
+        }
+        Memory.clearCache()
+        log("Phase 1 done: layer fwd=\(String(format: "%.0f", layerFwdMs))ms bwd=\(String(format: "%.0f", layerBwdMs))ms peak=\(layerPeakMem / (1024*1024))MB")
+
+        // ── Phase 2: Profile HEAD overhead (embedding only, 0 blocks) ──
+        do {
+            let model = GPT2Model(config: probeConfig)
+            let tokens = MLXArray(Array(repeating: Int32(1), count: batchSize * seqLen))
+                .reshaped(batchSize, seqLen)
+            let upstream = MLXRandom.normal([batchSize, seqLen, dModel])
+            MLX.eval(model, tokens, upstream)
+            Memory.clearCache()
+
+            Memory.peakMemory = 0
+            let memBefore = Memory.activeMemory
+
+            let t0 = clock.now
+            let fwd = model.forwardFrontHalf(tokens, splitAt: 0)
+            MLX.eval(fwd)
+            headFwdMs = Self.durationMs(from: t0, to: clock.now)
+
+            // Use grad on a float proxy input instead of valueAndGrad(model:)
+            // to avoid computing gradients for all model parameters
+            let floatTokens = tokens.asType(.float32)
+            MLX.eval(floatTokens)
+            let t1 = clock.now
+            let gradFn = grad { (input: MLXArray) -> MLXArray in
+                let intTokens = input.asType(.int32)
+                let act = model.forwardFrontHalf(intTokens, splitAt: 0)
+                return (act * upstream).sum()
+            }
+            let g = gradFn(floatTokens)
+            MLX.eval(g)
+            headBwdMs = Self.durationMs(from: t1, to: clock.now)
+            headPeakMem = max(0, Int(Memory.peakMemory) - Int(memBefore))
+        }
+        Memory.clearCache()
+        log("Phase 2 done: head fwd=\(String(format: "%.0f", headFwdMs))ms bwd=\(String(format: "%.0f", headBwdMs))ms peak=\(headPeakMem / (1024*1024))MB")
+
+        // ── Phase 3: Profile TAIL overhead (finalNorm + lm_head, 0 blocks) ──
+        do {
+            let model = GPT2Model(config: probeConfig)
+            let act = MLXRandom.normal([batchSize, seqLen, dModel])
+            let targets = MLXArray(Array(repeating: Int32(0), count: batchSize * seqLen))
+                .reshaped(batchSize, seqLen)
+            MLX.eval(model, act, targets)
+            Memory.clearCache()
+
+            Memory.peakMemory = 0
+            let memBefore = Memory.activeMemory
+
+            let t0 = clock.now
+            let fwd = model.forwardBackHalf(act, fromLayer: 1)
+            MLX.eval(fwd)
+            tailFwdMs = Self.durationMs(from: t0, to: clock.now)
+
+            // Use grad on input activation to avoid model-parameter gradients
+            let t1 = clock.now
+            let gradFn = grad { (input: MLXArray) -> MLXArray in
+                tailLoss(model: model, inputActivation: input, targets: targets, fromLayer: 1)
+            }
+            let g = gradFn(act)
+            MLX.eval(g)
+            tailBwdMs = Self.durationMs(from: t1, to: clock.now)
+            tailPeakMem = max(0, Int(Memory.peakMemory) - Int(memBefore))
+        }
+        Memory.clearCache()
+        log("Phase 3 done: tail fwd=\(String(format: "%.0f", tailFwdMs))ms bwd=\(String(format: "%.0f", tailBwdMs))ms peak=\(tailPeakMem / (1024*1024))MB")
+
+        // Scale the HEAD/TAIL peak memory to account for real vocab size embedding
+        // Probe used small vocab; real embedding = vocabSize × dModel × 4 bytes
+        let realEmbeddingBytes = vocabSize * dModel * 4
+        let probeEmbeddingBytes = probeVocab * dModel * 4
+        let embeddingDelta = max(0, realEmbeddingBytes - probeEmbeddingBytes)
+        headPeakMem += embeddingDelta
+        tailPeakMem += embeddingDelta
+
+        log(String(format: "Profile results: layer=%.0f+%.0fms head=%.0f+%.0fms tail=%.0f+%.0fms",
+                   layerFwdMs, layerBwdMs, headFwdMs, headBwdMs, tailFwdMs, tailBwdMs))
+        log(String(format: "Memory: layer=%dMB head=%dMB tail=%dMB avail=%dMB",
+                   layerPeakMem / (1024 * 1024), headPeakMem / (1024 * 1024),
+                   tailPeakMem / (1024 * 1024), Int(availableMemory) / (1024 * 1024)))
+
+        // ── Build PROFILE_RESULT ──
+        #if canImport(UIKit)
+        let deviceType: UInt32 = UIDevice.current.userInterfaceIdiom == .pad ? 2 : 1
+        #else
+        let deviceType: UInt32 = 3
+        #endif
+
+        var result = Data()
+        result.append(PipelineMsg.profileResult)
+        appendBigEndian(&result, workerId)
+        Self.appendBEFloat(&result, Float(layerFwdMs))
+        Self.appendBEFloat(&result, Float(layerBwdMs))
+        appendBigEndian(&result, Self.clampedUInt32(layerPeakMem))
+        Self.appendBEFloat(&result, Float(headFwdMs))
+        Self.appendBEFloat(&result, Float(headBwdMs))
+        appendBigEndian(&result, Self.clampedUInt32(headPeakMem))
+        Self.appendBEFloat(&result, Float(tailFwdMs))
+        Self.appendBEFloat(&result, Float(tailBwdMs))
+        appendBigEndian(&result, Self.clampedUInt32(tailPeakMem))
+        let availableMemoryMB = availableMemory / (1024 * 1024)
+        appendBigEndian(&result, Self.clampedUInt32(availableMemoryMB))
+        appendBigEndian(&result, deviceType)
+
+        return result
     }
 
     // MARK: - Training Loop
@@ -363,7 +577,7 @@ final class PipelineTrainingManager {
         currentStep = 0
 
         let capturedStageInfo = self.stageInfo
-        let capturedConfig = self.config
+        let capturedConfig = self.modelConfig
         let M = capturedStageInfo.numMicroBatches
         let capturedTotalSteps = self.totalSteps
         let capturedWorkerId = self.workerId
@@ -377,6 +591,12 @@ final class PipelineTrainingManager {
                 )
             } else if capturedStageInfo.isTail {
                 try await runTailLoop(
+                    connection: connection, model: model, optimizer: optimizer,
+                    config: capturedConfig, stageInfo: capturedStageInfo,
+                    M: M, totalSteps: capturedTotalSteps, workerId: capturedWorkerId
+                )
+            } else {
+                try await runMiddleLoop(
                     connection: connection, model: model, optimizer: optimizer,
                     config: capturedConfig, stageInfo: capturedStageInfo,
                     M: M, totalSteps: capturedTotalSteps, workerId: capturedWorkerId
@@ -397,10 +617,10 @@ final class PipelineTrainingManager {
         config: TransformerConfig, stageInfo: PipelineStageInfo,
         M: Int, totalSteps: Int, workerId: UInt32
     ) async throws {
-        let splitAt = stageInfo.lastLayer
+        let splitAt = max(1, stageInfo.lastLayer - stageInfo.firstLayer)
 
         await MainActor.run { [weak self] in
-            self?.log("HEAD loop: layers [0..\(splitAt)), \(M) micro-batches, \(totalSteps) steps")
+            self?.log("HEAD loop: global layers [\(stageInfo.firstLayer)..\(stageInfo.lastLayer)), local [0..\(splitAt)), \(M) micro-batches, \(totalSteps) steps")
         }
 
         // Wrap frontSurrogateLoss to match valueAndGrad(model:, (Model, MLXArray, MLXArray) -> MLXArray)
@@ -428,44 +648,41 @@ final class PipelineTrainingManager {
                 batchTokens[mbId] = tokens
             }
 
-            // ── Forward + send activations ──
-            for m in 0..<M {
-                guard let tokens = batchTokens[m] else { continue }
+            // ── 1F1B schedule: warm up forward, then alternate forward/backward ──
+            var accumulatedGrads: NestedDictionary<String, MLXArray>? = nil
+            // Keep all forward sends ahead of backward receives for now.  The
+            // server relay is async, so network writes still overlap compute,
+            // while avoiding a startup dependency cycle seen in the 1F1B loop.
+            let warmup = M
+            let sendQueue = PipelineFrameSendQueue(connection: connection)
+            var sendTasks: [Task<Double, Error>] = []
 
+            func enqueueActivation(_ m: Int, tokens: MLXArray) async throws {
                 let t0 = clock.now
                 let act = model.forwardFrontHalf(tokens, splitAt: splitAt)
                 MLX.eval(act)
-                let fwdMs = Self.durationMs(from: t0, to: clock.now)
-                totalForwardMs += fwdMs
+                totalForwardMs += Self.durationMs(from: t0, to: clock.now)
 
-                // Send activation to server for relay
-                let ts = clock.now
-                do {
-                    let actData = try saveToData(arrays: ["activation": act])
-                    var msg = Data()
-                    msg.append(PipelineMsg.activation)
-                    Self.appendBE(&msg, UInt32(m))
-                    Self.appendBE(&msg, UInt32(stageInfo.stageIndex))
-                    Self.appendBE(&msg, UInt32(stageInfo.stageIndex + 1))
-                    msg.append(0) // has_targets = false (server attaches them)
-                    Self.appendBE(&msg, UInt32(0)) // targets_len = 0
-                    Self.appendBE(&msg, UInt32(actData.count))
-                    msg.append(actData)
-                    try await Self.sendFrame(connection: connection, payload: msg)
-                } catch {
-                    await MainActor.run { [weak self] in
-                        self?.log("Head: error sending activation: \(error)")
-                    }
-                    return
-                }
-                totalSendMs += Self.durationMs(from: ts, to: clock.now)
+                let actData = try saveToData(arrays: ["activation": act])
+                var msg = Data()
+                msg.append(PipelineMsg.activation)
+                Self.appendBE(&msg, UInt32(m))
+                Self.appendBE(&msg, UInt32(stageInfo.stageIndex))
+                Self.appendBE(&msg, UInt32(stageInfo.stageIndex + 1))
+                msg.append(0) // has_targets = false (server attaches them)
+                Self.appendBE(&msg, UInt32(0)) // targets_len = 0
+                Self.appendBE(&msg, UInt32(actData.count))
+                msg.append(actData)
+
+                sendTasks.append(Task {
+                    let ts = clock.now
+                    try await sendQueue.send(msg)
+                    return Self.durationMs(from: ts, to: clock.now)
+                })
             }
 
-            // ── Receive gradients + backward (with gradient accumulation) ──
-            var accumulatedGrads: NestedDictionary<String, MLXArray>? = nil
-
-            for m in 0..<M {
-                guard let tokens = batchTokens[m] else { continue }
+            func receiveGradientAndBackward(_ m: Int) async throws {
+                guard let tokens = batchTokens[m] else { return }
 
                 let tr = clock.now
                 let gradFrame = try await Self.receiveFrameOrStop(connection: connection)
@@ -473,7 +690,7 @@ final class PipelineTrainingManager {
                     await MainActor.run { [weak self] in
                         self?.log("Head: expected GRADIENT, got 0x\(String(format: "%02x", gradFrame[0]))")
                     }
-                    continue
+                    return
                 }
                 totalRecvMs += Self.durationMs(from: tr, to: clock.now)
 
@@ -494,6 +711,30 @@ final class PipelineTrainingManager {
                 }
                 MLX.eval(accumulatedGrads!)
                 totalBackwardMs += Self.durationMs(from: tb, to: clock.now)
+            }
+
+            for m in 0..<warmup {
+                if let tokens = batchTokens[m] {
+                    try await enqueueActivation(m, tokens: tokens)
+                }
+            }
+
+            for k in 0..<(M - warmup) {
+                let forwardMicroBatch = warmup + k
+                if let tokens = batchTokens[forwardMicroBatch] {
+                    try await enqueueActivation(forwardMicroBatch, tokens: tokens)
+                }
+                try await receiveGradientAndBackward(k)
+            }
+
+            if warmup > 0 {
+                for m in (M - warmup)..<M {
+                    try await receiveGradientAndBackward(m)
+                }
+            }
+
+            for task in sendTasks {
+                totalSendMs += try await task.value
             }
 
             // ── Single optimizer step with accumulated gradients ──
@@ -559,10 +800,10 @@ final class PipelineTrainingManager {
         config: TransformerConfig, stageInfo: PipelineStageInfo,
         M: Int, totalSteps: Int, workerId: UInt32
     ) async throws {
-        let fromLayer = stageInfo.firstLayer
+        let fromLayer = 0
 
         await MainActor.run { [weak self] in
-            self?.log("TAIL loop: layers [\(fromLayer)..\(config.nLayers)), \(M) micro-batches, \(totalSteps) steps")
+            self?.log("TAIL loop: global layers [\(stageInfo.firstLayer)..\(stageInfo.lastLayer)), local [0..\(config.nLayers)), \(M) micro-batches, \(totalSteps) steps")
         }
 
         var totalForwardMs: Double = 0
@@ -577,6 +818,8 @@ final class PipelineTrainingManager {
 
             let clock = ContinuousClock()
             var accumulatedGrads: NestedDictionary<String, MLXArray>? = nil
+            let sendQueue = PipelineFrameSendQueue(connection: connection)
+            var sendTasks: [Task<Double, Error>] = []
 
             for m in 0..<M {
                 // ── Receive activation from server (or STOP) ──
@@ -630,41 +873,38 @@ final class PipelineTrainingManager {
                 runningLoss = runningLoss * 0.9 + lossFloat * 0.1
                 if stepCount == 0 && m == 0 { runningLoss = lossFloat }
 
-                // ── Send loss report ──
-                do {
-                    var lossMsg = Data()
-                    lossMsg.append(PipelineMsg.lossReport)
-                    Self.appendBE(&lossMsg, UInt32(miniBatch))
-                    Self.appendBE(&lossMsg, UInt32(m))
-                    Self.appendBEFloat(&lossMsg, lossFloat)
-                    Self.appendBE(&lossMsg, UInt32(stepCount))
-                    try await Self.sendFrame(connection: connection, payload: lossMsg)
-                } catch {
-                    await MainActor.run { [weak self] in
-                        self?.log("Tail: error sending loss report: \(error)")
-                    }
-                }
+                // ── Queue loss report ──
+                var lossMsg = Data()
+                lossMsg.append(PipelineMsg.lossReport)
+                Self.appendBE(&lossMsg, UInt32(miniBatch))
+                Self.appendBE(&lossMsg, UInt32(m))
+                Self.appendBEFloat(&lossMsg, lossFloat)
+                Self.appendBE(&lossMsg, UInt32(stepCount))
+                sendTasks.append(Task {
+                    let ts = clock.now
+                    try await sendQueue.send(lossMsg)
+                    return Self.durationMs(from: ts, to: clock.now)
+                })
 
-                // ── Send gradient upstream ──
-                let ts = clock.now
-                do {
-                    let gradData = try saveToData(arrays: ["grad": activationGrad])
-                    var gradMsg = Data()
-                    gradMsg.append(PipelineMsg.gradient)
-                    Self.appendBE(&gradMsg, UInt32(m))
-                    Self.appendBE(&gradMsg, UInt32(stageInfo.stageIndex))
-                    Self.appendBE(&gradMsg, UInt32(stageInfo.stageIndex - 1))
-                    Self.appendBEFloat(&gradMsg, lossFloat)
-                    Self.appendBE(&gradMsg, UInt32(gradData.count))
-                    gradMsg.append(gradData)
-                    try await Self.sendFrame(connection: connection, payload: gradMsg)
-                } catch {
-                    await MainActor.run { [weak self] in
-                        self?.log("Tail: error sending gradient: \(error)")
-                    }
-                    return
-                }
-                totalSendMs += Self.durationMs(from: ts, to: clock.now)
+                // ── Queue gradient upstream ──
+                let gradData = try saveToData(arrays: ["grad": activationGrad])
+                var gradMsg = Data()
+                gradMsg.append(PipelineMsg.gradient)
+                Self.appendBE(&gradMsg, UInt32(m))
+                Self.appendBE(&gradMsg, UInt32(stageInfo.stageIndex))
+                Self.appendBE(&gradMsg, UInt32(stageInfo.stageIndex - 1))
+                Self.appendBEFloat(&gradMsg, lossFloat)
+                Self.appendBE(&gradMsg, UInt32(gradData.count))
+                gradMsg.append(gradData)
+                sendTasks.append(Task {
+                    let ts = clock.now
+                    try await sendQueue.send(gradMsg)
+                    return Self.durationMs(from: ts, to: clock.now)
+                })
+            }
+
+            for task in sendTasks {
+                totalSendMs += try await task.value
             }
 
             // ── Single optimizer step with accumulated gradients ──
@@ -720,6 +960,217 @@ final class PipelineTrainingManager {
             if miniBatch % 10 == 0 || miniBatch < 5 {
                 let logMsg = String(format: "[TAIL step %d] loss=%.4f fwd=%.1fms bwd=%.1fms send=%.1fms recv=%.1fms eff=%.0f%%",
                                     miniBatch + 1, runningLoss, avgFwd, avgBwd, avgSnd, avgRcv, efficiency)
+                await MainActor.run { [weak self] in self?.log(logMsg) }
+            }
+        }
+    }
+
+    // MARK: - Middle Worker Loop
+
+    private nonisolated func runMiddleLoop(
+        connection: NWConnection, model: GPT2Model, optimizer: AdamW,
+        config: TransformerConfig, stageInfo: PipelineStageInfo,
+        M: Int, totalSteps: Int, workerId: UInt32
+    ) async throws {
+        let fromLayer = 0
+        let toLayer = max(1, stageInfo.lastLayer - stageInfo.firstLayer)
+
+        await MainActor.run { [weak self] in
+            self?.log("MIDDLE loop: global layers [\(stageInfo.firstLayer)..\(stageInfo.lastLayer)), local [\(fromLayer)..\(toLayer)), \(M) micro-batches, \(totalSteps) steps")
+        }
+
+        // Surrogate loss: output = forwardMiddle(input), loss = sum(output * stopGrad(upstream))
+        // valueAndGrad gives us parameter grads; separate grad call gives activation grad for upstream.
+        let capturedFromLayer = fromLayer
+        let capturedToLayer = toLayer
+        let lossFn = valueAndGrad(model: model) { (model: GPT2Model, inputAct: MLXArray, upstreamGrads: MLXArray) -> MLXArray in
+            middleSurrogateLoss(model: model, inputActivation: inputAct, upstreamGrads: upstreamGrads,
+                                fromLayer: capturedFromLayer, toLayer: capturedToLayer)
+        }
+
+        var totalForwardMs: Double = 0
+        var totalBackwardMs: Double = 0
+        var totalSendMs: Double = 0
+        var totalRecvMs: Double = 0
+        var stepCount: Int = 0
+
+        for miniBatch in 0..<totalSteps {
+            if Task.isCancelled { return }
+
+            let clock = ContinuousClock()
+
+            // ── 1F1B schedule: warm up forward, then alternate forward/backward ──
+            var savedActivations: [Int: MLXArray] = [:]
+            var accumulatedGrads: NestedDictionary<String, MLXArray>? = nil
+            // Keep all forward sends ahead of backward receives for now.  The
+            // server relay is async, so network writes still overlap compute,
+            // while avoiding a startup dependency cycle seen in the 1F1B loop.
+            let warmup = M
+            let sendQueue = PipelineFrameSendQueue(connection: connection)
+            var sendTasks: [Task<Double, Error>] = []
+
+            func receiveForwardAndSend(_ m: Int) async throws {
+                let tr = clock.now
+                let actFrame = try await Self.receiveFrameOrStop(connection: connection)
+                guard actFrame[0] == PipelineMsg.activation else {
+                    await MainActor.run { [weak self] in
+                        self?.log("Middle: expected ACTIVATION, got 0x\(String(format: "%02x", actFrame[0]))")
+                    }
+                    return
+                }
+                let parsed = Self.parseActivation(actFrame)
+                let inputAct = parsed.activation
+                savedActivations[m] = inputAct
+                totalRecvMs += Self.durationMs(from: tr, to: clock.now)
+
+                let t0 = clock.now
+                let outputAct = model.forwardMiddle(inputAct, fromLayer: fromLayer, toLayer: toLayer)
+                MLX.eval(outputAct)
+                totalForwardMs += Self.durationMs(from: t0, to: clock.now)
+
+                let actData = try saveToData(arrays: ["activation": outputAct])
+                var msg = Data()
+                msg.append(PipelineMsg.activation)
+                Self.appendBE(&msg, UInt32(m))
+                Self.appendBE(&msg, UInt32(stageInfo.stageIndex))
+                Self.appendBE(&msg, UInt32(stageInfo.stageIndex + 1))
+                msg.append(0) // has_targets = false (server attaches them)
+                Self.appendBE(&msg, UInt32(0)) // targets_len = 0
+                Self.appendBE(&msg, UInt32(actData.count))
+                msg.append(actData)
+
+                sendTasks.append(Task {
+                    let ts = clock.now
+                    try await sendQueue.send(msg)
+                    return Self.durationMs(from: ts, to: clock.now)
+                })
+            }
+
+            func receiveBackwardAndSend(_ m: Int) async throws {
+                guard let inputAct = savedActivations[m] else { return }
+
+                let tr = clock.now
+                let gradFrame = try await Self.receiveFrameOrStop(connection: connection)
+                guard gradFrame[0] == PipelineMsg.gradient else {
+                    await MainActor.run { [weak self] in
+                        self?.log("Middle: expected GRADIENT, got 0x\(String(format: "%02x", gradFrame[0]))")
+                    }
+                    return
+                }
+                totalRecvMs += Self.durationMs(from: tr, to: clock.now)
+
+                let (_, _, upstreamGrads) = Self.parseGradient(gradFrame)
+
+                // Backward: get parameter grads via surrogate loss
+                let tb = clock.now
+                let (_, paramGrads) = lossFn(model, inputAct, upstreamGrads)
+
+                // Also compute activation gradient for upstream stage
+                let activationGradFn = grad { (act: MLXArray) -> MLXArray in
+                    middleSurrogateLoss(model: model, inputActivation: act, upstreamGrads: upstreamGrads,
+                                        fromLayer: capturedFromLayer, toLayer: capturedToLayer)
+                }
+                let activationGrad = activationGradFn(inputAct)
+                MLX.eval(activationGrad)
+
+                // Accumulate parameter gradients
+                if accumulatedGrads == nil {
+                    accumulatedGrads = paramGrads
+                } else {
+                    accumulatedGrads = accumulatedGrads!.mapValues(paramGrads, transform: { acc, g in
+                        acc + (g ?? MLXArray(Float(0)))
+                    })
+                }
+                MLX.eval(accumulatedGrads!)
+                totalBackwardMs += Self.durationMs(from: tb, to: clock.now)
+
+                let gradData = try saveToData(arrays: ["grad": activationGrad])
+                var gradMsg = Data()
+                gradMsg.append(PipelineMsg.gradient)
+                Self.appendBE(&gradMsg, UInt32(m))
+                Self.appendBE(&gradMsg, UInt32(stageInfo.stageIndex))
+                Self.appendBE(&gradMsg, UInt32(stageInfo.stageIndex - 1))
+                Self.appendBEFloat(&gradMsg, Float(0)) // middle doesn't have loss
+                Self.appendBE(&gradMsg, UInt32(gradData.count))
+                gradMsg.append(gradData)
+
+                sendTasks.append(Task {
+                    let ts = clock.now
+                    try await sendQueue.send(gradMsg)
+                    return Self.durationMs(from: ts, to: clock.now)
+                })
+            }
+
+            for m in 0..<warmup {
+                try await receiveForwardAndSend(m)
+            }
+
+            for k in 0..<(M - warmup) {
+                try await receiveForwardAndSend(warmup + k)
+                try await receiveBackwardAndSend(k)
+            }
+
+            if warmup > 0 {
+                for m in (M - warmup)..<M {
+                    try await receiveBackwardAndSend(m)
+                }
+            }
+
+            for task in sendTasks {
+                totalSendMs += try await task.value
+            }
+
+            // ── Single optimizer step with accumulated gradients ──
+            if let finalGrads = accumulatedGrads {
+                let scale = MLXArray(Float(1.0) / Float(M))
+                let avgGrads = finalGrads.mapValues(transform: { g in g * scale })
+                optimizer.update(model: model, gradients: avgGrads)
+                MLX.eval(model, optimizer)
+            }
+
+            // ── Sync barrier ──
+            let barrierFrame = try await Self.receiveFrameOrStop(connection: connection)
+            guard barrierFrame[0] == PipelineMsg.syncBarrier else {
+                await MainActor.run { [weak self] in
+                    self?.log("Middle: expected SYNC_BARRIER")
+                }
+                continue
+            }
+            let mbId = Self.readBE32(barrierFrame, offset: 1)
+
+            var ack = Data()
+            ack.append(PipelineMsg.syncAck)
+            Self.appendBE(&ack, mbId)
+            Self.appendBE(&ack, workerId)
+            try await Self.sendFrame(connection: connection, payload: ack)
+
+            stepCount += 1
+
+            // Update metrics
+            let totalMicroSteps = Double(stepCount * M)
+            let avgFwd = totalForwardMs / totalMicroSteps
+            let avgBwd = totalBackwardMs / totalMicroSteps
+            let avgSnd = totalSendMs / totalMicroSteps
+            let avgRcv = totalRecvMs / totalMicroSteps
+            let seqTime = avgFwd + avgBwd + avgSnd + avgRcv
+            let efficiency = seqTime > 0 ? (avgFwd + avgBwd) / seqTime * 100 : 0
+
+            let capturedMiniBatch = miniBatch
+            await MainActor.run { [weak self] in
+                self?.currentStep = capturedMiniBatch + 1
+                self?.progress = Double(capturedMiniBatch + 1) / Double(totalSteps)
+                self?.avgForwardMs = avgFwd
+                self?.avgBackwardMs = avgBwd
+                self?.avgSendMs = avgSnd
+                self?.avgRecvMs = avgRcv
+                self?.pipelineEfficiency = efficiency
+                self?.status = String(format: "MIDDLE step %d/%d — fwd=%.0fms bwd=%.0fms",
+                                      capturedMiniBatch + 1, totalSteps, avgFwd, avgBwd)
+            }
+
+            if miniBatch % 10 == 0 || miniBatch < 5 {
+                let logMsg = String(format: "[MIDDLE step %d] fwd=%.1fms bwd=%.1fms send=%.1fms recv=%.1fms eff=%.0f%%",
+                                    miniBatch + 1, avgFwd, avgBwd, avgSnd, avgRcv, efficiency)
                 await MainActor.run { [weak self] in self?.log(logMsg) }
             }
         }
@@ -842,6 +1293,24 @@ final class PipelineTrainingManager {
 
     private nonisolated static func appendBEFloat(_ data: inout Data, _ value: Float) {
         withUnsafeBytes(of: value.bitPattern.bigEndian) { data.append(contentsOf: $0) }
+    }
+
+    private nonisolated static func clampedUInt32(_ value: Int) -> UInt32 {
+        if value <= 0 {
+            return 0
+        }
+        if value > Int(UInt32.max) {
+            return UInt32.max
+        }
+        return UInt32(value)
+    }
+
+    private nonisolated static func clampedUInt32(_ value: UInt64) -> UInt32 {
+        UInt32(min(value, UInt64(UInt32.max)))
+    }
+
+    private nonisolated static func clampedUInt32(_ value: UInt) -> UInt32 {
+        UInt32(min(value, UInt(UInt32.max)))
     }
 
     private nonisolated static func readBE32(_ data: Data, offset: Int) -> UInt32 {

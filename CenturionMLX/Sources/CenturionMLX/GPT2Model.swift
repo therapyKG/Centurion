@@ -168,6 +168,19 @@ public class GPT2Model: Module {
         return x
     }
 
+    /// Forward through a middle slice: blocks[fromLayer..<toLayer].
+    /// No embedding, no finalNorm/LM-head.  Returns activation [B, S, dModel].
+    public func forwardMiddle(_ activation: MLXArray, fromLayer: Int, toLayer: Int) -> MLXArray {
+        let S = activation.dim(1)
+        let mask = createCausalMask(seqLen: S)
+
+        var x = activation
+        for i in fromLayer..<toLayer {
+            x = blocks[i](x, mask: mask)
+        }
+        return x
+    }
+
     /// Forward through only the back half: blocks[fromLayer..<nLayers] + finalNorm + LM head.
     /// Returns logits [B, S, vocabSize].
     public func forwardBackHalf(_ activation: MLXArray, fromLayer: Int) -> MLXArray {
@@ -210,6 +223,21 @@ public func frontSurrogateLoss(
     splitAt: Int
 ) -> MLXArray {
     let activation = model.forwardFrontHalf(inputs, splitAt: splitAt)
+    return (activation * stopGradient(upstreamGrads)).sum()
+}
+
+// MARK: - Middle Surrogate Loss for Pipeline Training
+
+/// Surrogate loss for a middle pipeline stage.
+/// Same trick as frontSurrogateLoss but applied to forwardMiddle.
+public func middleSurrogateLoss(
+    model: GPT2Model,
+    inputActivation: MLXArray,
+    upstreamGrads: MLXArray,
+    fromLayer: Int,
+    toLayer: Int
+) -> MLXArray {
+    let activation = model.forwardMiddle(inputActivation, fromLayer: fromLayer, toLayer: toLayer)
     return (activation * stopGradient(upstreamGrads)).sum()
 }
 

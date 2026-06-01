@@ -89,6 +89,116 @@ struct OrchestratorView: View {
                             .font(.caption)
                             .foregroundStyle(.orange)
                     }
+
+                    Button("Restart Server") {
+                        manager.restartServer()
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.orange)
+                    .disabled(manager.serverState == .training)
+                }
+
+                // MARK: - Profiling
+                if manager.isProfiling {
+                    Section("Profiling") {
+                        HStack {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Benchmarking workers...")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                if !manager.profilingResults.isEmpty {
+                    Section("Pipeline Efficiency") {
+                        if let utilization = manager.pipelineUtilization {
+                            LabeledContent("Utilization") {
+                                Text(Self.percentString(utilization))
+                                    .monospacedDigit()
+                                    .fontWeight(.semibold)
+                            }
+                            ProgressView(value: utilization)
+                                .tint(utilization >= 0.75 ? .green : utilization >= 0.55 ? .orange : .red)
+                        }
+
+                        if let bubbleEfficiency = manager.pipelineBubbleEfficiency,
+                           let bubbleFraction = manager.pipelineBubbleFraction {
+                            LabeledContent("Work vs Bubbles") {
+                                Text("\(Self.percentString(bubbleEfficiency)) / \(Self.percentString(bubbleFraction))")
+                                    .monospacedDigit()
+                            }
+                        }
+
+                        if let stageBalance = manager.pipelineStageBalance {
+                            LabeledContent("Stage Balance") {
+                                Text(Self.percentString(stageBalance))
+                                    .monospacedDigit()
+                            }
+                        }
+
+                        LabeledContent("Schedule") {
+                            Text("\(manager.pipelineStageCount) stages • \(manager.microBatches) micro-batches")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    Section("Worker Assignments") {
+                        ForEach(manager.profilingResults) { result in
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Image(systemName: result.deviceType == 2 ? "ipad" : "iphone")
+                                        .foregroundStyle(.blue)
+                                    Text("W\(result.workerId)")
+                                        .fontWeight(.semibold)
+                                    Text(result.roleName)
+                                        .font(.caption)
+                                        .fontWeight(.bold)
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(
+                                            result.isHead ? Color.green.opacity(0.2) :
+                                            result.isTail ? Color.orange.opacity(0.2) :
+                                            Color.blue.opacity(0.2)
+                                        )
+                                        .clipShape(Capsule())
+                                    Spacer()
+                                    Text("\(result.deviceName)")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+
+                                HStack {
+                                    VStack(alignment: .leading) {
+                                        Text("Layers [\(result.firstLayer)..\(result.lastLayer))")
+                                            .font(.caption.monospaced())
+                                        Text(String(format: "%.1f L/s • %d MB", result.computeSpeed, result.availableMemoryMB))
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    VStack(alignment: .trailing) {
+                                        Text(String(format: "~%.0f ms/step", result.estimatedStepMs))
+                                            .font(.caption.monospaced())
+                                        Text(String(format: "RTT %.0f ms", result.rttMs))
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+
+                                // Capacity bar
+                                let capacity = result.maxLayers > 0
+                                    ? Double(result.assignedLayers) / Double(result.maxLayers)
+                                    : 0
+                                ProgressView(value: capacity)
+                                    .tint(capacity < 0.7 ? .green : capacity < 0.9 ? .orange : .red)
+                                Text("\(result.assignedLayers)/\(result.maxLayers) layers capacity")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.vertical, 4)
+                        }
+                    }
                 }
 
                 // MARK: - Live Metrics
@@ -187,6 +297,10 @@ struct OrchestratorView: View {
                 .multilineTextAlignment(.trailing)
                 .frame(width: 100)
         }
+    }
+
+    private static func percentString(_ value: Double) -> String {
+        String(format: "%.1f%%", value * 100)
     }
 }
 
